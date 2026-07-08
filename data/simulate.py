@@ -4,16 +4,16 @@ import math
 from dataclasses import dataclass
 from typing import Sequence
 
-import numpy as np
-from scipy.signal import fftconvolve
+import numpy as np  # 수치 계산 라이브러리
+from scipy.signal import fftconvolve  # FFT 기반 고속 convolution
 
-import gpuRIR  # type: ignore
+import gpuRIR  # type: ignore  # GPU RIR(Room Impulse Response) 시뮬레이션 라이브러리
 
-
-FS = 16_000
-AUDIO_LEN = 4 * FS
-N_SPK = 2
-SPEED_OF_SOUND = 343.0
+# 음향 시뮬레이션의 기본 파라미터
+FS = 16_000  # 샘플링 레이트: 16kHz
+AUDIO_LEN = 4 * FS  # 오디오 길이: 4초 = 64,000 샘플
+N_SPK = 2  # 최대 화자 수: 2명
+SPEED_OF_SOUND = 343.0  # 음속: 실온 기준 343 m/s
 
 # 시뮬레이션 생성 환경
 @dataclass(frozen=True)
@@ -50,26 +50,30 @@ class SimulationConfig:
 
 # RMS(Root Mean Square) 계산: 신호의 크기 측정
 def _rms(signal: np.ndarray) -> float:
+    # sqrt(mean(signal^2) + eps): 신호의 에너지(크기)를 계산, 1e-10은 numerical stability 위한 작은값
     return float(np.sqrt(np.mean(np.square(signal), dtype=np.float64) + 1e-10))
 
 
 # 신호를 정확한 길이로 조정
 def _trim_or_pad(signal: np.ndarray, length: int) -> np.ndarray:
-    signal = signal.astype(np.float32, copy=False)
+    signal = signal.astype(np.float32, copy=False)  # float32로 변환
     if signal.shape[0] >= length:  # 신호가 length보다 길면
-        return signal[:length].copy()
+        return signal[:length].copy()  # 처음 length 샘플만 자르기
+    # 신호가 length보다 짧으면, 뒤에 0을 padding하여 length가 되도록 조정
     return np.pad(signal, (0, length - signal.shape[0])).astype(np.float32)
 
 
-# 신호를 특정 dB 비율로 스케일링
+# 신호를 특정 dB 비율로 스케일링: ref 기준 signal과 target_dB만큼 차이나도록
+# target_dB = 20log[{scale * rms(sig)}/rms(ref)] -> scale = rms(ref) * 10^(target_dB/20) / rms(sig)
 def _scale_to_db(reference: np.ndarray, signal: np.ndarray, target_db: float) -> float:
-    return _rms(reference) / (10.0 ** (target_db / 20.0) * (_rms(signal) + 1e-10))
+    # reference에 대해 signal의 상대적 크기가 target_dB가 되도록 하는 scale factor 계산
+    return _rms(reference) * (10.0 ** (target_db / 20.0)) / (_rms(signal) + 1e-10)
 
 
 # 신호 최댓값 기준으로 정규화, -0.95~0.95 범위로 조정되어 오버플러우 방지
 def _normalize_peak(signal: np.ndarray, peak: float = 0.95) -> np.ndarray:
-    max_value = np.max(np.abs(signal)) + 1e-10
-    return (signal * (peak / max_value)).astype(np.float32)
+    max_value = np.max(np.abs(signal)) + 1e-10  # 신호의 최댓값(절대값) 계산
+    return (signal * (peak / max_value)).astype(np.float32)  # peak=0.95가 되도록 스케일링
 
 
 def _sample_room_and_rt60(
@@ -77,62 +81,64 @@ def _sample_room_and_rt60(
 ) -> tuple[np.ndarray, float]:
     room = np.array(
         [
-            rng.uniform(config.room_size_min_m[0], config.room_size_max_m[0]),  # 방의 가로(X) - min: 3.0m ~ max: 10.0m 범위의 균등 분포 
-            rng.uniform(config.room_size_min_m[1], config.room_size_max_m[1]),  # 방의 세로(Y) - min: 3.0m ~ max: 8.0m 범위의 균등 분포 
-            rng.uniform(config.room_size_min_m[2], config.room_size_max_m[2]),  # 방의 높이(Z) - min: 2.5m ~ max: 6.0m 범위의 균등 분포 
+            rng.uniform(config.room_size_min_m[0], config.room_size_max_m[0]),  # 방의 가로(X): [3.0m, 10.0m]
+            rng.uniform(config.room_size_min_m[1], config.room_size_max_m[1]),  # 방의 세로(Y): [3.0m, 8.0m]
+            rng.uniform(config.room_size_min_m[2], config.room_size_max_m[2]),  # 방의 높이(Z): [2.5m, 6.0m]
         ],
         dtype=np.float64,
     )
-    rt60 = float(rng.uniform(*config.rt60_s))  # (0.2, 1.3)
+    rt60 = float(rng.uniform(*config.rt60_s))  # Reverberation Time: 음이 1/1000로 감쇠하는 시간 [0.2s, 1.3s]
     return room, rt60
 
 
-# 마이크 배열의 중심 좌표
+# 마이크 배열의 중심 좌표를 방 내에서 무작위 위치로 샘플링
 def _sample_array_center(
     room_size: np.ndarray, rng: np.random.Generator, config: SimulationConfig
 ) -> np.ndarray:
-    z_low = min(max(0.5, config.min_wall_distance_m), room_size[2] - config.min_wall_distance_m)  # 마이크의 최소 높이
-    z_high = max(z_low, min(room_size[2] - config.min_wall_distance_m, 2.0))                      # 마이크의 최대 높이
+    # 높이 범위 계산: 바닥/천장으로부터 최소거리 유지하면서 0.5~2.0m 범위
+    z_low = min(max(0.5, config.min_wall_distance_m), room_size[2] - config.min_wall_distance_m)
+    z_high = max(z_low, min(room_size[2] - config.min_wall_distance_m, 2.0))
     return np.array(
         [
-            rng.uniform(config.min_wall_distance_m, room_size[0] - config.min_wall_distance_m),  # 가로(X)
-            rng.uniform(config.min_wall_distance_m, room_size[1] - config.min_wall_distance_m),  # 세로(Y)
-            rng.uniform(z_low, z_high),                                                          # 높이(Z): 0.5 ~ 2.0m
+            rng.uniform(config.min_wall_distance_m, room_size[0] - config.min_wall_distance_m),  # X좌표: 벽에서 최소거리
+            rng.uniform(config.min_wall_distance_m, room_size[1] - config.min_wall_distance_m),  # Y좌표: 벽에서 최소거리
+            rng.uniform(z_low, z_high),                                                          # Z좌표(높이): [z_low, z_high]
         ],
         dtype=np.float64,
     )
 
 
 def _room_corners(room_size: np.ndarray, config: SimulationConfig) -> np.ndarray:
-    low = np.full(3, config.min_wall_distance_m, dtype=np.float64)
-    high = room_size - config.min_wall_distance_m
+    # 방의 모서리 8개 좌표 계산 (벽에서 최소거리 내 범위)
+    low = np.full(3, config.min_wall_distance_m, dtype=np.float64)  # 최소값 좌표
+    high = room_size - config.min_wall_distance_m  # 최대값 좌표
     return np.array(
         [
-            [low[0], low[1], low[2]],
-            [low[0], low[1], high[2]],
-            [low[0], high[1], low[2]],
-            [low[0], high[1], high[2]],
-            [high[0], low[1], low[2]],
-            [high[0], low[1], high[2]],
-            [high[0], high[1], low[2]],
-            [high[0], high[1], high[2]],
+            [low[0], low[1], low[2]],   # 모서리 1: (min_x, min_y, min_z)
+            [low[0], low[1], high[2]],  # 모서리 2: (min_x, min_y, max_z)
+            [low[0], high[1], low[2]],  # 모서리 3: (min_x, max_y, min_z)
+            [low[0], high[1], high[2]], # 모서리 4: (min_x, max_y, max_z)
+            [high[0], low[1], low[2]],  # 모서리 5: (max_x, min_y, min_z)
+            [high[0], low[1], high[2]], # 모서리 6: (max_x, min_y, max_z)
+            [high[0], high[1], low[2]], # 모서리 7: (max_x, max_y, min_z)
+            [high[0], high[1], high[2]], # 모서리 8: (max_x, max_y, max_z)
         ],
         dtype=np.float64,
     )
 
 
-# 구면 좌표를 직교 좌표로 변환
+# 구면 좌표(spherical)를 직교 좌표(cartesian)로 변환
+# (r, azimuth, elevation) -> (x, y, z)
 def _spherical_to_cartesian(
     distance_m: float, azimuth_deg: float, elevation_deg: float
 ) -> np.ndarray:
-    # degree를 radian으로 변환
-    azimuth = math.radians(azimuth_deg)
-    elevation = math.radians(elevation_deg)
+    azimuth = math.radians(azimuth_deg)  # azimuth: degree -> radian
+    elevation = math.radians(elevation_deg)  # elevation: degree -> radian
     return np.array(
         [
-            distance_m * math.sin(elevation) * math.cos(azimuth),  # x좌표
-            distance_m * math.sin(elevation) * math.sin(azimuth),  # y좌표
-            distance_m * math.cos(elevation),                      # z좌표
+            distance_m * math.sin(elevation) * math.cos(azimuth),  # x = r*sin(el)*cos(az)
+            distance_m * math.sin(elevation) * math.sin(azimuth),  # y = r*sin(el)*sin(az)
+            distance_m * math.cos(elevation),                      # z = r*cos(el)
         ],
         dtype=np.float64,
     )
@@ -150,11 +156,14 @@ def _sample_elevation_deg(
     rng: np.random.Generator, config: SimulationConfig
 ) -> float:
     if not config.elevation_use_vmf:
-        return float(rng.uniform(*config.elevation_deg))      # uniform fallback
-    mu = math.radians(config.elevation_vmf_mu_deg)            # 기본값 pi
-    phi = float(rng.vonmises(mu, config.elevation_vmf_kappa))  # (-pi, pi], +-pi 근처 집중
-    phi = phi % (2.0 * math.pi)                                # [0, 2pi), pi 근처 집중
-    elev_deg = math.degrees(phi / 2.0)                         # [0, 180], 90도 근처 집중
+        # 균등분포: 논문의 GI-DOAEnet 동작 복원
+        return float(rng.uniform(*config.elevation_deg))
+    # von Mises 분포 사용: 수평면(90도) 근처에 집중
+    mu = math.radians(config.elevation_vmf_mu_deg)  # mu=180도(π) -> radian 변환
+    phi = float(rng.vonmises(mu, config.elevation_vmf_kappa))  # von Mises(μ=π, κ=2): (-π, π] 범위의 각도 샘플
+    phi = phi % (2.0 * math.pi)  # (-π, π] -> [0, 2π): 음수를 양수로 정규화
+    elev_deg = math.degrees(phi / 2.0)  # [0, 2π) -> [0, π] radian -> [0, 180] degree (90도 근처 집중)
+    # 설정된 범위 내로 클리핑
     return float(np.clip(elev_deg, config.elevation_deg[0], config.elevation_deg[1]))
 
 
@@ -166,37 +175,37 @@ def _sample_source_position(
     rng: np.random.Generator,
     config: SimulationConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    '''
-    - 스피커(음성): 마이크 가까이 (0.5m~)
-        직접음이 강함
-        위치 추정의 주요 대상
-    '''
+    # 스피커 위치 샘플링: 유효한 위치가 나올때까지 최대 1024번 시도
     for _ in range(1024):
-        distance = float(rng.uniform(*config.source_distance_m))  # 마이크로부터의 거리: 0.3 ~ 2.5m
-        azimuth = float(rng.uniform(*config.azimuth_deg))         # azimuth: 0 ~ 360
-        elevation = _sample_elevation_deg(rng, config)            # elevation: vMF(A.10) 또는 uniform
+        # 구면 좌표로 음원 위치 샘플링
+        distance = float(rng.uniform(*config.source_distance_m))  # 거리: [0.3m, 2.5m]
+        azimuth = float(rng.uniform(*config.azimuth_deg))  # 방위각: [0도, 360도]
+        elevation = _sample_elevation_deg(rng, config)  # 고도각: vMF 또는 균등분포
 
+        # 스피커 간 최소 간격(10도) 확인
         if any(
-            min(abs(azimuth - prev), 360.0 - abs(azimuth - prev))
-            < config.min_speaker_gap_deg  
-            for prev in used_azimuths     # 현재 각도가 이전 각도에 대해 10도 미만이면
+            min(abs(azimuth - prev), 360.0 - abs(azimuth - prev))  # 원형 각도 거리 계산
+            < config.min_speaker_gap_deg  # 최소 간격과 비교
+            for prev in used_azimuths  # 기존 스피커 각도들과 비교
         ):
-            continue  # 스피커 간 최소 10도 간격 필요 -> 10도 미만이면 다시 시도
+            continue  # 간격 미충족 -> 다시 샘플링
 
-        relative = _spherical_to_cartesian(distance, azimuth, elevation)  # 구면 좌표 -> 직교 좌표
-        absolute = array_center + relative                                # 마이크 배열 중심으로부터의 절대 좌표
-        
-        # 유효성 검증: 스피커가 방 안에 있는가? -> 성공하면 절대좌표, 구면좌표 반환
-        if np.all(absolute >= config.min_wall_distance_m) and np.all(absolute <= room_size - config.min_wall_distance_m): 
+        # 구면 좌표 -> 직교 좌표 변환
+        relative = _spherical_to_cartesian(distance, azimuth, elevation)  # 마이크 중심 기준 상대 좌표
+        absolute = array_center + relative  # 방 전체 기준 절대 좌표
+
+        # 유효성 검증: 스피커가 방 내 벽으로부터 최소거리를 유지하는가?
+        if np.all(absolute >= config.min_wall_distance_m) and np.all(absolute <= room_size - config.min_wall_distance_m):
+            # 조건 만족 -> 절대좌표와 극좌표 반환
             polar = np.array([azimuth, elevation, distance], dtype=np.float32)
             return absolute.astype(np.float64), polar
 
-    # 1024번의 루프가 모두 실패하면
-    distance = float(rng.uniform(config.source_distance_m[0], min(2.5, config.source_distance_m[1])))  # 마이크로부터의 거리: 0.3~2.5m
+    # Fallback: 1024번 시도 후 실패시, 벽 범위 내로 강제로 클리핑
+    distance = float(rng.uniform(config.source_distance_m[0], min(2.5, config.source_distance_m[1])))
     azimuth = float(rng.uniform(*config.azimuth_deg))
     elevation = _sample_elevation_deg(rng, config)
     relative = _spherical_to_cartesian(distance, azimuth, elevation)
-    # 벽 범위 내로 클리핑
+    # 벽 범위 내로 강제 클리핑
     absolute = np.clip(
         array_center + relative,
         config.min_wall_distance_m,
@@ -206,35 +215,38 @@ def _sample_source_position(
     return absolute.astype(np.float64), polar
 
 
-# 마이크 어레이 중심 기준으로 노이즈 음원의 상대 위치 계산
+# 마이크 어레이 중심 기준으로 노이즈 음원의 위치 계산
+# 노이즈는 스피커와 달리 마이크로부터 최소 2.5m 이상 떨어져야함 (배경음 시뮬레이션)
 def _sample_noise_position(
     room_size: np.ndarray,
     array_center: np.ndarray,
     rng: np.random.Generator,
     config: SimulationConfig,
 ) -> np.ndarray:
-    '''
-    - 노이즈(배경음): 마이크 멀리 (2.5m~)
-        멀리서 오는 배경음 시뮬레이션
-        스피커를 방해하지 않게
-    '''
+    # 방 내 유효 범위 정의 (벽으로부터 최소거리)
     low = np.full(3, config.min_wall_distance_m, dtype=np.float64)
     high = room_size - config.min_wall_distance_m
+
+    # 유효한 노이즈 위치 샘플링 (최대 1024번 시도)
     for _ in range(1024):
-        absolute = rng.uniform(low, high).astype(np.float64)
+        absolute = rng.uniform(low, high).astype(np.float64)  # 방 내 균등분포로 샘플링
+        # 마이크로부터의 거리가 최소거리(2.5m) 이상인가?
         if np.linalg.norm(absolute - array_center) >= config.min_noise_distance_m:
-            return absolute
+            return absolute  # 조건 만족 -> 위치 반환
 
-    corners = _room_corners(room_size, config)
-    distances = np.linalg.norm(corners - array_center[None, :], axis=1)
-    farthest_idx = int(np.argmax(distances))
+    # Fallback: 1024번 실패시, 방의 가장 먼 모서리로 지정
+    corners = _room_corners(room_size, config)  # 8개 모서리 좌표
+    distances = np.linalg.norm(corners - array_center[None, :], axis=1)  # 각 모서리까지의 거리
+    farthest_idx = int(np.argmax(distances))  # 가장 먼 모서리 인덱스
     if distances[farthest_idx] >= config.min_noise_distance_m:
-        return corners[farthest_idx]
+        return corners[farthest_idx]  # 가장 먼 모서리 위치 반환
 
+    # 예외: 아무 위치도 최소거리 조건을 만족하지 못하면 에러
     raise ValueError("Cannot place coherent noise at the required minimum distance.")
 
 
-# RIR bank 생성
+# RIR(Room Impulse Response) bank 생성
+# 각 음원(스피커, 노이즈)에 대한 모든 마이크의 RIR을 계산
 def _render_rir_bank(
     room_size: np.ndarray,
     source_positions: np.ndarray,
@@ -242,80 +254,83 @@ def _render_rir_bank(
     rt60: float,
     config: SimulationConfig,
 ) -> np.ndarray:
-    # 벽 반사 계수
+    # Sabine 이론으로 벽 반사 계수(beta) 계산: RT60 기반
     beta = gpuRIR.beta_SabineEstimation(room_size, rt60)
 
-    # 직접/초기 반사 이후에 확산음(diffuse field)으로 넘어간다고 볼 시간
+    # 초기 반사에서 확산음(diffuse field)으로 전환되는 시간
+    # 이 시점 이후로는 확산음만 계산하여 계산량 감소
     t_diff = float(gpuRIR.att2t_SabineEstimator(config.rir_diffuse_attenuation_db, rt60))
-    
-    # RIR를 어디까지 계산할지 정하는 최대 시간
+
+    # RIR 계산 최대 시간: 이 이후는 무시할 정도로 약해짐
     t_max = float(gpuRIR.att2t_SabineEstimator(config.rir_end_attenuation_db, rt60))
 
-    # image source method에서 몇 차 반사까지 계산할지 정하는 값
+    # Image source method: t_diff 시점까지 몇 차 반사까지 계산할지 결정
     nb_img = gpuRIR.t2n(t_diff, room_size)
 
-    # 실제 RIR 계산 호출
+    # gpuRIR로 실제 RIR 계산 (Image source + 확산음 혼합)
     return gpuRIR.simulateRIR(
-        room_sz=room_size,
-        beta=beta,
-        pos_src=source_positions,
-        pos_rcv=mic_positions,
-        nb_img=nb_img,
-        Tmax=t_max,
-        fs=config.sample_rate,
-        Tdiff=t_diff,
-        spkr_pattern="omni",
-        mic_pattern="omni",
+        room_sz=room_size,  # 방의 크기 [X, Y, Z]
+        beta=beta,  # 벽 반사 계수
+        pos_src=source_positions,  # 음원 위치 (num_sources, 3)
+        pos_rcv=mic_positions,  # 마이크 위치 (num_mics, 3)
+        nb_img=nb_img,  # Image source 계산 깊이
+        Tmax=t_max,  # RIR 최대 시간
+        fs=config.sample_rate,  # 샘플링 레이트
+        Tdiff=t_diff,  # 확산음으로 전환되는 시간
+        spkr_pattern="omni",  # 무지향성 스피커
+        mic_pattern="omni",  # 무지향성 마이크
     )
 
 
 def _apply_rir_bank(
-        signal: np.ndarray, 
-        rir_bank: np.ndarray, 
+        signal: np.ndarray,
+        rir_bank: np.ndarray,
         length: int,
         convolution_device: str = "cpu",
     ) -> np.ndarray:
-    '''
-    단일 채널 signal에 각 마이크용 RIR 적용하여 멀티채널 신호로
-    각 마이크마다 조금씩 다르게 들리는 멀티채널 신호 반환
-    '''
+    # 단일 채널 signal에 각 마이크용 RIR을 convolution하여 멀티채널 신호로 변환
+    # 각 마이크마다 조금씩 다른 RIR이 적용되므로 서로 다른 음향 특성 가짐
     if convolution_device == "cuda":
         try:
             import torch
             import torch.nn.functional as F
 
             if torch.cuda.is_available():
+                # signal: (L,) -> (1, L) 텐서로 변환, GPU로 전송
                 signal_t = torch.from_numpy(signal).float().to("cuda").unsqueeze(0)  # (1, L)
-                rir_t = torch.from_numpy(rir_bank).float().to("cuda")  # (C: 채널 수, R: RIR 길이)
+                # rir_bank: (C, R) 텐서로 변환, GPU로 전송 (C: 채널 수, R: RIR 길이)
+                rir_t = torch.from_numpy(rir_bank).float().to("cuda")
 
                 outputs = []
                 for c in range(rir_t.shape[0]):
-                    # 각 채널별 convolution
-                    rir_c = rir_t[c].unsqueeze(0).unsqueeze(0)  # (R, , ) -> (1, 1, R)
+                    # 채널 c의 RIR 가져오기
+                    rir_c = rir_t[c].unsqueeze(0).unsqueeze(0)  # (R,) -> (1, 1, R)
+                    # Conv1d로 convolution 수행: signal_t(1,1,L) * rir_c(1,1,R) -> (1,1,L+R-1)
                     out = F.conv1d(
-                        signal_t.unsqueeze(1),  # (1, 1, L)
-                        rir_c,                  # 필터로 사용할 현재 채널의 RIR
-                        padding=rir_t.shape[1] - 1  # R-1 -> output length: L+R-1
-                    ).squeeze().cpu().numpy()
+                        signal_t.unsqueeze(1),  # (1, L) -> (1, 1, L)
+                        rir_c,  # 필터: (1, 1, R)
+                        padding=rir_t.shape[1] - 1  # R-1 padding으로 output length = L+R-1
+                    ).squeeze().cpu().numpy()  # (1,1,L+R-1) -> (L+R-1,) -> numpy로 변환
 
-                    # 원하는 length로 자르거나 패딩해서 저장
+                    # 결과를 원하는 length로 trim 또는 pad
                     outputs.append(_trim_or_pad(out.astype(np.float32), length))
 
-                return np.stack(outputs, axis=0)  # (C, length)
+                return np.stack(outputs, axis=0)  # (C, length) 형태로 스택
         except Exception:
-            # GPU convolution이 실패하면 CPU convolution으로 fallback
+            # GPU convolution 실패 시 CPU로 fallback
             pass
 
-    # 기본 경로: CPU convolution
+    # CPU convolution (기본 경로)
     return np.stack(
         [
             _trim_or_pad(
+                # FFT 기반 고속 convolution으로 각 채널별 RIR 적용
                 fftconvolve(signal, rir, mode="full").astype(np.float32),
-                length,
+                length,  # 결과를 원하는 길이로 조정
             )
-            for rir in rir_bank
+            for rir in rir_bank  # rir_bank의 각 채널(행)에 대해 반복
         ],
-        axis=0,
+        axis=0,  # 채널 축으로 스택: (C, length)
     )
 
 
@@ -326,26 +341,32 @@ def simulate_one_sample(
         rng: np.random.Generator,
         config: SimulationConfig | None = None,
     ) -> dict[str, np.ndarray]:
-    config = config or SimulationConfig()
-    length = config.segment_samples
-    num_channels = int(mic_coords.shape[0])  # mic_coors.shape = (C, 3) - C행 3열(x,y,z 좌표)
-    max_speakers = config.max_speakers
-    num_active_speakers = int(rng.integers(1, max_speakers + 1))  # 1~max_speaker 명
+    # 입력: speeches (활성 화자별 mono 음성), coherent_noise (배경음), mic_coords (마이크 배열 상대좌표)
+    # 출력: 멀티채널 mixture와 라벨 정보
+    config = config or SimulationConfig()  # 기본 설정 사용
+    length = config.segment_samples  # 오디오 길이: 64,000 샘플
+    num_channels = int(mic_coords.shape[0])  # 마이크 채널 수 (mic_coords shape: (C, 3))
+    max_speakers = config.max_speakers  # 최대 화자 수: 2
+    num_active_speakers = int(rng.integers(1, max_speakers + 1))  # 활성 화자 수: 1 또는 2
 
+    # 유효한 방 구성 샘플링 (최대 1024번 시도)
     for _ in range(1024):
+        # 방의 크기와 reverb time 샘플링
         room_size, rt60 = _sample_room_and_rt60(rng, config)
+        # 마이크 배열 중심 위치 샘플링
         array_center = _sample_array_center(room_size, rng, config)
-        # 상대좌표(mic_coords) + array_center -> 각 마이크의 절대좌표, 벽에 너무 붙지 않게 clipping
+        # 각 마이크의 절대 좌표: 상대좌표(mic_coords) + array_center, 벽 범위 내 클리핑
         mic_positions = np.clip(mic_coords.astype(np.float64) + array_center[None, :],
                                 config.min_wall_distance_m,
                                 room_size - config.min_wall_distance_m)
 
-        source_positions = []  # 음원들의 절대 위치
-        polar_positions = np.zeros((max_speakers, 3), dtype=np.float32)  # 화자 라벨 저장할 배열
-        used_azimuths: list[float] = []  # 이미 사용한 azimuths
+        source_positions = []  # 활성 화자들의 절대 위치 저장
+        polar_positions = np.zeros((max_speakers, 3), dtype=np.float32)  # 모든 화자의 극좌표 [az, el, dist]
+        used_azimuths: list[float] = []  # 이미 사용한 azimuth 각도
 
+        # 각 활성 화자의 위치 샘플링
         for speaker_idx in range(num_active_speakers):
-            # 화자의 절대좌표, 극좌표
+            # 화자의 절대좌표(cartesian)와 극좌표(spherical) 샘플링
             absolute, polar = _sample_source_position(
                 room_size=room_size,
                 array_center=array_center,
@@ -353,84 +374,92 @@ def simulate_one_sample(
                 rng=rng,
                 config=config,
             )
-            source_positions.append(absolute)
-            polar_positions[speaker_idx] = polar
-            used_azimuths.append(float(polar[0]))
+            source_positions.append(absolute)  # 절대좌표 저장
+            polar_positions[speaker_idx] = polar  # 극좌표 저장
+            used_azimuths.append(float(polar[0]))  # azimuth 기록
 
+        # 노이즈 위치 샘플링 (마이크로부터 최소 2.5m 떨어짐)
         try:
             noise_position = _sample_noise_position(room_size, array_center, rng, config)
         except ValueError:
-            continue
-        break
+            continue  # 노이즈 위치를 찾지 못하면 전체 방 구성 재샘플링
+        break  # 유효한 구성 찾음
     else:
         raise RuntimeError("Failed to sample a valid room geometry for coherent noise.")
 
-    # RIR bank 생성
+    # RIR bank 생성: 활성 화자 + 노이즈 위치에 대한 모든 마이크의 RIR
     rir_bank = _render_rir_bank(
         room_size=room_size,
-        source_positions=np.vstack(source_positions + [noise_position]),
-        mic_positions=mic_positions,
+        source_positions=np.vstack(source_positions + [noise_position]),  # (num_sources, 3)
+        mic_positions=mic_positions,  # (num_channels, 3)
         rt60=rt60,
         config=config,
-    )
+    )  # rir_bank shape: (num_sources, num_channels, rir_length)
 
-    speech_signals = []  # 각 화자별 멀티채널 신호 저장
+    # 각 화자의 mono 음성을 RIR로 멀티채널 변환
+    speech_signals = []  # 화자별 멀티채널 신호
     for speaker_idx in range(max_speakers):
-        if speaker_idx >= num_active_speakers:  # 비활성 화자면
-            speech_signals.append(np.zeros((num_channels, length), dtype=np.float32))  # 0으로 채운 멀티채널 신호 삽입
+        if speaker_idx >= num_active_speakers:
+            # 비활성 화자: 0으로 채운 더미 신호 (max_speakers와의 shape 맞춤)
+            speech_signals.append(np.zeros((num_channels, length), dtype=np.float32))
             continue
 
-        speech = _trim_or_pad(speeches[speaker_idx], length)  # 화자의 mono 음성을 length 길이로 맞춤
+        # 활성 화자: mono 음성에 RIR 적용하여 멀티채널 신호 생성
+        speech = _trim_or_pad(speeches[speaker_idx], length)  # mono 음성을 정확한 길이로 조정
         speech_signals.append(
             _apply_rir_bank(
-                speech,
-                rir_bank[speaker_idx],
+                speech,  # (L,)
+                rir_bank[speaker_idx],  # (num_channels, rir_length)
                 length,
                 convolution_device=config.rir_convolution_device,
             )
-        )  # RIR bank 적용하여 멀티채널 신호로 변환
+        )  # (num_channels, length)
 
-    coherent_noise = _trim_or_pad(coherent_noise, length)  # noise 길이를 length로 맞춤
-    # noise에 RIR 적용하여 멀티채널 coherent noise 생성
+    # 배경음(coherent noise)을 멀티채널로 변환
+    coherent_noise = _trim_or_pad(coherent_noise, length)  # 길이 조정
     coherent_noise_mc = _apply_rir_bank(
         coherent_noise,
-        rir_bank[num_active_speakers],
+        rir_bank[num_active_speakers],  # 노이즈의 RIR (rir_bank의 마지막 행)
         length,
         convolution_device=config.rir_convolution_device,
-    )
-    # 채널별로 독립 백색잡음 생성
+    )  # (num_channels, length)
+
+    # 채널별 독립 백색 잡음 생성
     white_noise = rng.standard_normal((num_channels, length)).astype(np.float32)
 
-    mixed_speech = speech_signals[0].copy()
-    for speaker_idx in range(1, num_active_speakers):  # 두 번쩨 active speaker 부터
-        sir_db = float(rng.uniform(*config.utterance_sir_db))
-        # 첫 번쩨 채널(화자)을 기준으로 현재 화자를 얼마나 키우거나 줄일지 계산
+    # 여러 화자의 음성 혼합
+    mixed_speech = speech_signals[0].copy()  # 첫 번째 화자부터 시작
+    for speaker_idx in range(1, num_active_speakers):
+        # 화자 간 간섭 (SIR) 설정: 첫 화자 기준 현재 화자를 얼마나 키우거나 줄일지
+        sir_db = float(rng.uniform(*config.utterance_sir_db))  # SIR: [-5, 5] dB
+        # 스케일 계산: 첫 화자(기준)과의 dB 차이가 sir_db가 되도록
         scale = _scale_to_db(mixed_speech[0], speech_signals[speaker_idx][0], sir_db)
-        # 스케일한 화자 신호를 현재 speech mixture에 더함
+        # 스케일된 화자 신호 혼합
         mixed_speech += speech_signals[speaker_idx] * scale
-    
-    # coherent noise와 white noise 사이의 비율을 랜덤으로
-    noise_sir_db = float(rng.uniform(*config.noise_sir_db))
+
+    # 두 가지 노이즈 혼합: coherent noise + white noise
+    noise_sir_db = float(rng.uniform(*config.noise_sir_db))  # coherent noise 대 white noise 비율
     white_scale = _scale_to_db(coherent_noise_mc[0], white_noise[0], noise_sir_db)
-    mixed_noise = coherent_noise_mc + white_noise * white_scale
+    mixed_noise = coherent_noise_mc + white_noise * white_scale  # (num_channels, length)
 
-    # speech 대 noise의 전체 SNR 목표값을 랜덤으로
-    snr_db = float(rng.uniform(*config.snr_db))
-    noise_scale = _scale_to_db(mixed_speech[0], mixed_noise[0], snr_db)  # noise 비율 설정
-    mixture = _normalize_peak(mixed_speech + mixed_noise * noise_scale)  # speech + noise, peak normalize
+    # 음성 대 노이즈의 전체 SNR 설정
+    snr_db = float(rng.uniform(*config.snr_db))  # SNR: [-5, 30] dB
+    noise_scale = _scale_to_db(mixed_speech[0], mixed_noise[0], snr_db)
+    # 최종 혼합: speech + noise, peak normalization으로 클리핑 방지
+    mixture = _normalize_peak(mixed_speech + mixed_noise * noise_scale)  # (num_channels, length)
 
-    # AGG-RL inference.py는 (max_spk, 3, T) 형태의 spherical_position을 기대한다.
-    # 모델이 LearnableNuDFT.get_trajectory_framed로 시간축에 대해 framing하여
-    # 이동 음원까지 처리하기 때문이다. 여기서는 음원이 정적이므로 화자별
-    # [az, el, dist]를 시간축으로 broadcast한다.
+    # 극좌표를 (max_speakers, 3, length) 형태로 확장
+    # AGG-RL 모델은 시간축 framing을 지원하므로, 정적 음원은 모든 시간에 동일한 위치
     spherical_position = np.broadcast_to(
-        polar_positions[:, :, None], (max_speakers, 3, length)
+        polar_positions[:, :, None],  # (max_speakers, 3, 1)
+        (max_speakers, 3, length)  # (max_speakers, 3, length)로 broadcast
     ).astype(np.float32)
 
     return {
-        "input_audio": mixture.astype(np.float32),              # 최종 멀티채널 mixture (C, L)
-        "mic_coordinate": mic_coords.astype(np.float32),        # 마이크 상대좌표 (C, 3)
-        "polar_position": polar_positions.astype(np.float32),   # 각 화자의 [azimuth, elevation, distance] (GI-DOAEnet 호환)
-        "spherical_position": spherical_position,               # (max_spk, 3, T) AGG-RL inference 포맷
-        "n_spk": np.int64(num_active_speakers),                 # 실제 활성 화자 수
+        # 시뮬레이션 결과 반환
+        "input_audio": mixture.astype(np.float32),  # 최종 멀티채널 mixture: (num_channels, length)
+        "mic_coordinate": mic_coords.astype(np.float32),  # 마이크 배열 상대좌표: (num_channels, 3)
+        "polar_position": polar_positions.astype(np.float32),  # 화자의 극좌표: (max_speakers, 3) = [az, el, dist]
+        "spherical_position": spherical_position,  # 시간축 확장된 극좌표: (max_speakers, 3, length)
+        "n_spk": np.int64(num_active_speakers),  # 실제 활성 화자 수 (1 또는 2)
     }

@@ -25,19 +25,19 @@ def spatial_spectrum_loss(
             f"Output/target shape mismatch: {tuple(output.shape)} vs {tuple(target.shape)}"
         )
 
+    eps = 1e-7
     layer_losses = []
     for layer_idx in range(output.shape[1]):
-        pred = output[:, layer_idx]
+        pred = output[:, layer_idx].clamp(eps, 1.0 - eps)
         tgt = target[:, layer_idx].float()
-        # weight = 1 + (rho - 1) * S  ->  positive(S=1)에서 rho, negative(S=0)에서 1
-        # (soft label의 경우 S에 비례해 선형 보간)
-        weight = 1.0 + (positive_weight - 1.0) * tgt
-        layer_loss = F.binary_cross_entropy(
-            pred,
-            tgt,
-            weight=weight,
-            reduction="mean",
-        )
+        # 논문 Eq.22: positive 항(S·logŜ)에만 rho 가중, negative 항((1-S)·log(1-Ŝ))은 가중 1.
+        #   L = -mean[ rho * S * log(Ŝ) + (1 - S) * log(1 - Ŝ) ]
+        # (기존 F.binary_cross_entropy(weight=1+(rho-1)S)는 negative 항까지 곱해져
+        #  soft-label peak 주변을 과하게 억눌러 peak가 약해지는 버그가 있었다.)
+        layer_loss = -(
+            positive_weight * tgt * torch.log(pred)
+            + (1.0 - tgt) * torch.log(1.0 - pred)
+        ).mean()
         layer_losses.append(layer_loss)
 
     losses = torch.stack(layer_losses)

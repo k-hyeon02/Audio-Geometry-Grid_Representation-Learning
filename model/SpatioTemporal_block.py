@@ -22,7 +22,7 @@ class Dualpath_block(torch.nn.Module):
 
         x_steered = x_steered.permute(0, 3, 1, 2).contiguous().view(B*T, C, M)
         x_steered = x_steered.permute(1, 0, 2) # C, B*T, M
-        x_steered, _ = self.mhsa(x_steered, x_steered, x_steered)
+        x_steered, _ = self.mhsa(x_steered, x_steered, x_steered)  # Linear layer 마지막에 포함되어 있음
 
         x_steered = x_steered.permute(1, 0, 2)  # B*T, C, M
         x_steered = x_steered.contiguous().view(B, T, C, M).permute(0, 2, 3, 1).contiguous().view(B*C, M, T)

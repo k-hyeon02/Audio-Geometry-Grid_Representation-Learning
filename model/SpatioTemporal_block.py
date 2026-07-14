@@ -24,7 +24,7 @@ class Dualpath_block(torch.nn.Module):
         x_steered = x_steered.permute(1, 0, 2) # C, B*T, M
         x_steered, _ = self.mhsa(x_steered, x_steered, x_steered)
 
-        x_steered = x_steered.permute(1, 2, 0)  # B*T, C, M
+        x_steered = x_steered.permute(1, 0, 2)  # B*T, C, M
         x_steered = x_steered.contiguous().view(B, T, C, M).permute(0, 2, 3, 1).contiguous().view(B*C, M, T)
 
         out = self.norm_mhsa(x_steered)

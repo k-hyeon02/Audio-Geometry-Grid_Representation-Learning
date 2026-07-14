@@ -156,7 +156,7 @@ class LearnableNuDFT(nn.Module):
         real_kernels = cos_part.unsqueeze(1)  # (K, 1, win_len) conv1d 실수부 커널 형태
         imag_kernels = sin_part.unsqueeze(1)  # (K, 1, win_len) conv1d 허수부 커널 형태
 
-        window = self.window.view(1, 1, -1)  # 모든 주파수 커널 broadcast용 윈도우 형태
+        window = self.window.view(1, 1, -1)  # 모든 주파수 커널 broadcast용 윈도우 형태(1, 1, win_len)
         real_kernels = real_kernels * window  # 실수부 기저의 분석 윈도우 적용
         imag_kernels = imag_kernels * window  # 허수부 기저의 분석 윈도우 적용
         kernels = torch.cat([real_kernels, imag_kernels], dim=0)  # 출력 채널 방향 실수·허수부 결합
@@ -164,14 +164,15 @@ class LearnableNuDFT(nn.Module):
 
     def forward(self, inputs: torch.Tensor, cplx: bool = True):
         """입력 (B, C, L)의 프레임별 비균일 DFT 실·허수부 또는 크기·위상 변환."""
-        batch_size, channel_count, sample_count = inputs.shape  # 입력 배치·채널·시간 축 길이
-        conv1d_kernel = self._build_kernels()  # 현재 bin 위치 대응 NUDFT 기저 커널
+        batch_size, channel_count, sample_count = inputs.shape  # 입력 배치·채널·시간 축 길이 (B, C, L)
+        conv1d_kernel = self._build_kernels()  # 현재 bin 위치 대응 NUDFT 기저 커널 (2K, 1, win_len)
         pad_size = (self.stride - sample_count % self.stride) % self.stride  # hop 단위 프레임 정렬용 오른쪽 padding 길이
-        x = inputs.view(batch_size * channel_count, 1, sample_count)  # 채널별 독립 conv1d 입력 형태
-        x = F.pad(x, [0, pad_size])  # 마지막 불완전 프레임의 0 padding
-        outputs = F.conv1d(x, conv1d_kernel.to(x.dtype), stride=self.stride)  # 프레임과 모든 NUDFT 기저의 내적
-        outputs = outputs.view(batch_size, channel_count, 2 * self.K, -1)  # 배치·채널 축 구조 복원
-        real, imag = torch.chunk(outputs, 2, dim=2)  # 앞 K개 실수부와 뒤 K개 허수부 분리
+        x = inputs.view(batch_size * channel_count, 1, sample_count)  # 채널별 독립 conv1d 입력 형태 (B*C, 1, L)
+        x = F.pad(x, [0, pad_size])  # 마지막 불완전 프레임의 0 padding (B*C, 1, L_padded)
+        # 프레임과 모든 NUDFT 기저의 내적 (B*C, 2K, T: 프레임 수)
+        outputs = F.conv1d(x, conv1d_kernel.to(x.dtype), stride=self.stride)  # T = (L_padded - win_len)/stride + 1
+        outputs = outputs.view(batch_size, channel_count, 2 * self.K, -1)  # 배치·채널 축 구조 복원 (B, C, 2K, T)
+        real, imag = torch.chunk(outputs, 2, dim=2)  # 앞 K개 실수부와 뒤 K개 허수부 분리 (B, C, K, T)
 
         if cplx:  # 복소 표현 요청 여부
             return real, imag  # 실수부와 허수부 반환

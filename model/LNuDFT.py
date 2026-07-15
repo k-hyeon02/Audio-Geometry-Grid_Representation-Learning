@@ -21,13 +21,13 @@ def init_kernels(win_len, win_inc, fft_len, win_type=None, invers=False):
         window = get_window(win_type, win_len, fftbins=True)  # FFT 기준 시간 윈도우
 
     fourier_basis = np.fft.rfft(np.eye(fft_len))[:win_len]  # 필요한 시간축 구간의 실수 입력 DFT 기저, np.eye: 단위 행렬 생성
-    real_kernel = np.real(fourier_basis)  # 복소 DFT 기저의 실수부: (win_len, F)
-    imag_kernel = np.imag(fourier_basis)  # 복소 DFT 기저의 허수부: (win_len, F)
+    real_kernel = np.real(fourier_basis)  # 복소 DFT 기저의 실수부: (win_len, K)
+    imag_kernel = np.imag(fourier_basis)  # 복소 DFT 기저의 허수부: (win_len, K)
 
-    # 주파수(F) 축으로 실수·허수부 결합 후 전치로 출력 채널 축 생성 -> (2F, win_len) = (출력채널, 커널길이)
+    # 주파수(K) 축으로 실수·허수부 결합 후 전치로 출력 채널 축 생성 → (2K, win_len) = (출력채널, 커널길이)
     kernel = np.concatenate([real_kernel, imag_kernel], axis=1).T
     if invers:  # 역변환용 커널 요청 여부
-        kernel = np.linalg.pinv(kernel).T  # 의사역행렬 기반 역변환 근사 커널: (win_len, 2F).T -> (2F, win_len)
+        kernel = np.linalg.pinv(kernel).T  # 의사역행렬 기반 역변환 근사 커널: (win_len, 2K).T → (2K, win_len)
 
     kernel = kernel * window  # 시간 표본별 분석 윈도우 적용
     kernel = kernel[:, None, :]  # conv1d용 입력 채널 축 추가
@@ -102,14 +102,14 @@ class LearnableNuDFT(nn.Module):
 
     def get_vad_framed(self, vad):
         """표본 단위 VAD의 LNuDFT 프레임 단위 이진 VAD 변환."""
-        batch_size, speaker_count, sample_count = vad.shape  # 입력 배치·화자·시간 축 길이 (B: 배치 크기, P: 화자 수, L: 표본 수)
-        vad = vad.view(batch_size * speaker_count, 1, sample_count)  # 화자별 독립 conv1d 입력 형태: (Batch, Channel, Time)
+        batch_size, speaker_count, sample_count = vad.shape  # 입력 배치·화자·시간 축 길이 (B, Q: 최대 화자 수, N: 표본 수)
+        vad = vad.view(batch_size * speaker_count, 1, sample_count)  # 화자별 독립 conv1d 입력 형태 (B*Q, 1, N)
         pad_size = (self.stride - sample_count) % self.stride  # 마지막 프레임이 hop 간격에 맞도록 오른쪽 padding 길이
         vad = F.pad(vad, [0, pad_size])  # 마지막 불완전 프레임의 0 padding
         vad = F.conv1d(vad, self.vad_kernel, stride=self.stride)  # 프레임별 평균 VAD
-        # 이진 VAD와 원래 축 구조 복원 (B, P, L), ge: greater than or equal -> Boolean tensor
+        # 이진 VAD와 원래 축 구조 복원 (B, Q, T), ge: greater than or equal → Boolean tensor
         vad = (vad.view(batch_size, speaker_count, -1).ge(self.vad_threshold).long()) # vad >= vad_threshold면 1.0, 아니면 0.0
-        return vad  # (B, 화자 수, 프레임 수) 이진 VAD 반환
+        return vad  # (B, Q, T) 프레임 단위 이진 VAD 반환
 
     def a_k_init(self, eps_start, eps_end):
         """logit 공간에서 고르게 배치한 초기 비균일 bin 간격 생성."""
@@ -137,14 +137,14 @@ class LearnableNuDFT(nn.Module):
 
     def get_trajectory_framed(self, trajectory):
         """표본 단위 3차원 궤적의 LNuDFT 프레임 격자 평균 궤적 변환."""
-        batch_size, speaker_count, coordinate_count, sample_count = trajectory.shape  # 입력 궤적의 축별 크기 (B, P, 3: xyz 좌표, L)
+        batch_size, speaker_count, coordinate_count, sample_count = trajectory.shape  # 입력 궤적의 축별 크기 (B, Q, 3: xyz 좌표, N)
         trajectory = trajectory.contiguous()  # view 전 연속 메모리 배치 보장
-        trajectory = trajectory.view(batch_size * speaker_count * coordinate_count, 1, sample_count)  # 좌표별 독립 conv1d 입력 형태: (Batch, Channel, Time)
+        trajectory = trajectory.view(batch_size * speaker_count * coordinate_count, 1, sample_count)  # 좌표별 독립 conv1d 입력 형태 (B*Q*3, 1, N)
         pad_size = (self.stride - sample_count) % self.stride  # 마지막 프레임 정렬용 오른쪽 padding 길이
-        trajectory = F.pad(trajectory, [0, pad_size], mode="replicate")  # 마지막 좌표 복제 기반 프레임 padding -> (B*P*3, 1, L_padded)
+        trajectory = F.pad(trajectory, [0, pad_size], mode="replicate")  # 마지막 좌표 복제 기반 프레임 padding → (B*Q*3, 1, N_padded)
         trajectory = F.conv1d(trajectory, self.vad_kernel, stride=self.stride)  # 프레임별 평균 좌표
         trajectory = trajectory.view(batch_size, speaker_count, coordinate_count, -1)  # 배치·화자·좌표 축 복원
-        return trajectory  # (B, P, 3, T: 프레임 수) 평균 궤적 반환
+        return trajectory  # (B, Q, 3, T) 프레임 단위 평균 궤적 반환
 
     def _build_kernels(self):
         """nu_k 기반 exp(-j·2pi·n·nu_k/N) 기저의 conv1d 커널 생성."""
@@ -163,14 +163,14 @@ class LearnableNuDFT(nn.Module):
         return kernels  # (2K, 1, win_len) NUDFT convolution 커널 반환
 
     def forward(self, inputs: torch.Tensor, cplx: bool = True):
-        """입력 (B, C, L)의 프레임별 비균일 DFT 실·허수부 또는 크기·위상 변환."""
-        batch_size, channel_count, sample_count = inputs.shape  # 입력 배치·채널·시간 축 길이 (B, C, L)
+        """입력 (B, C, N)의 프레임별 비균일 DFT 실·허수부 또는 크기·위상 변환."""
+        batch_size, channel_count, sample_count = inputs.shape  # 입력 배치·채널·시간 축 길이 (B, C, N)
         conv1d_kernel = self._build_kernels()  # 현재 bin 위치 대응 NUDFT 기저 커널 (2K, 1, win_len)
         pad_size = (self.stride - sample_count % self.stride) % self.stride  # hop 단위 프레임 정렬용 오른쪽 padding 길이
-        x = inputs.view(batch_size * channel_count, 1, sample_count)  # 채널별 독립 conv1d 입력 형태 (B*C, 1, L)
-        x = F.pad(x, [0, pad_size])  # 마지막 불완전 프레임의 0 padding (B*C, 1, L_padded)
-        # 프레임과 모든 NUDFT 기저의 내적 (B*C, 2K, T: 프레임 수)
-        outputs = F.conv1d(x, conv1d_kernel.to(x.dtype), stride=self.stride)  # T = (L_padded - win_len)/stride + 1
+        x = inputs.view(batch_size * channel_count, 1, sample_count)  # 채널별 독립 conv1d 입력 형태 (B*C, 1, N)
+        x = F.pad(x, [0, pad_size])  # 마지막 불완전 프레임의 0 padding (B*C, 1, N_padded)
+        # 프레임과 모든 NUDFT 기저의 내적 (B*C, 2K, T)
+        outputs = F.conv1d(x, conv1d_kernel.to(x.dtype), stride=self.stride)  # T = (N_padded - win_len)/stride + 1
         outputs = outputs.view(batch_size, channel_count, 2 * self.K, -1)  # 배치·채널 축 구조 복원 (B, C, 2K, T)
         real, imag = torch.chunk(outputs, 2, dim=2)  # 앞 K개 실수부와 뒤 K개 허수부 분리 (B, C, K, T)
 

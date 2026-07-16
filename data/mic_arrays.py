@@ -195,3 +195,115 @@ def sample_dynamic_array(num_channels: int,
     coords += rng.uniform(RORIGIN_CM[0], RORIGIN_CM[1], size=coords.shape).astype(np.float32) / 100.0
     coords -= coords.mean(axis=0, keepdims=True)  # 2단계 중심화: jitter 후 다시 중심화
     return coords.astype(np.float32)  # 배치된 마이크 배열 반환
+
+
+def _sample_dynamic_array_candidates(
+    rng: np.random.Generator,
+    count: int,
+    max_radius: float,
+) -> np.ndarray:
+    """동적 배열 후보 좌표를 한 번에 생성.
+
+    후보 방향과 반지름의 확률분포는 기존 scalar sampler와 동일하고,
+    반환 shape은 (count, 3).
+    """
+    directions = rng.normal(size=(count, 3))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True) + 1e-12
+    radii = rng.uniform(0.0, max_radius, size=(count, 1))
+    return (directions * radii).astype(np.float32)
+
+
+def sample_dynamic_array_vectorized(
+    num_channels: int,
+    rng: np.random.Generator | None = None,
+    max_attempts: int = 4096,
+    chunk_size: int = 256,
+) -> np.ndarray:
+    """기존 거리 분포를 유지하는 벡터화 동적 마이크 배열 생성.
+
+    후보 하나마다 Python loop와 ``np.stack``을 수행하던 기존 구현 대신,
+    후보를 ``chunk_size``개씩 생성해 모든 기존 마이크와의 거리를 한 번에
+    계산. 각 chunk에서 첫 번째 유효 후보를 선택하고 최대 시도 횟수와
+    fallback, 중심화, jitter는 기존 구현과 동일하게 유지.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    if num_channels < 2:
+        raise ValueError("num_channels must be at least 2.")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1.")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1.")
+
+    r_min, r_max = _pairwise_distance_bounds_m(num_channels, rng)
+    max_radius = 0.5 * r_max
+
+    # 반복적인 list -> np.stack 변환 제거를 위한 고정 크기 좌표 버퍼
+    positions = np.empty((num_channels, 3), dtype=np.float32)
+    positions[0] = _sample_dynamic_array_candidates(rng, 1, max_radius)[0]
+    num_placed = 1
+
+    while num_placed < num_channels:
+        accepted_candidate: np.ndarray | None = None
+        attempts_used = 0
+
+        while attempts_used < max_attempts:
+            current_chunk = min(chunk_size, max_attempts - attempts_used)
+            candidates = _sample_dynamic_array_candidates(
+                rng,
+                current_chunk,
+                max_radius,
+            )  # (candidate, 3)
+
+            # (candidate, 1, 3) - (1, placed_mic, 3)
+            # -> 후보별 기존 모든 마이크와의 거리 (candidate, placed_mic)
+            differences = (
+                candidates[:, None, :]
+                - positions[None, :num_placed, :]
+            )
+            distances = np.linalg.norm(differences, axis=2)
+            valid = np.all(
+                (distances >= r_min) & (distances <= r_max),
+                axis=1,
+            )
+            valid_indices = np.flatnonzero(valid)
+
+            if valid_indices.size > 0:
+                # scalar rejection sampling과 동일하게 첫 유효 후보 선택
+                accepted_candidate = candidates[int(valid_indices[0])]
+                break
+
+            attempts_used += current_chunk
+
+        if accepted_candidate is None:
+            # 최대 시도 횟수 소진 시 기존 원형 fallback 유지
+            ring_radius = min(
+                max_radius,
+                max(
+                    r_min
+                    / (2.0 * np.sin(np.pi / num_channels) + 1e-6),
+                    0.5 * r_min,
+                ),
+            )
+            angle = 2.0 * np.pi * num_placed / num_channels
+            accepted_candidate = np.array(
+                [
+                    ring_radius * np.cos(angle),
+                    ring_radius * np.sin(angle),
+                    0.0,
+                ],
+                dtype=np.float32,
+            )
+
+        positions[num_placed] = accepted_candidate
+        num_placed += 1
+
+    # 기존 sampler와 동일한 중심화 -> jitter -> 재중심화 순서
+    positions -= positions.mean(axis=0, keepdims=True)
+    positions += rng.uniform(
+        RORIGIN_CM[0],
+        RORIGIN_CM[1],
+        size=positions.shape,
+    ).astype(np.float32) / 100.0
+    positions -= positions.mean(axis=0, keepdims=True)
+    return positions.astype(np.float32)

@@ -1,2 +1,32 @@
-*.pyc
-datasets
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- 외부 데이터셋 (LibriSpeech / MS-SNSD / LOCATA, 약 49 GB) ---
+datasets/
+
+# --- 학습 산출물 ---
+checkpoints/
+data/train_runs/
+*.pt
+*.ckpt
+slurm-*.out
+*.log
+
+# --- 로컬 실행 스크립트 (절대경로·노드명이 박혀 있어 공개 부적합) ---
+scripts/
+
+# --- 폐기된 실험 코드 보관소 (archive/README.md 참고) ---
+archive/
+
+# --- 로컬 런 이름이 붙은 평가 산출물 (figures/overall.png 는 추적) ---
+figures/eval_*
+figures/loss_curve_*
+
+# --- 에디터 / 툴 로컬 설정 ---
+.claude/settings.local.json
+.vscode/
+.idea/
+.DS_Store

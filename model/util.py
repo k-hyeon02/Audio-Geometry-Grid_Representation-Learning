@@ -2,80 +2,104 @@ import torch
 from torch import nn
 import math
 
-def get_cos_distance( v1, v2, return_type='radian'):
-
-	v1_size=torch.linalg.norm(v1, dim=-1, keepdim=True)
-	v1_size=torch.where(v1_size==0.0, 1e-12, v1_size)
+def get_cos_distance(v1, v2, return_type='radian'):
+    """
+    코사인 유사도를 이용해 계산한 두 벡터 사이의 각도(geodesic angle) 반환하는 함수
+    """
+    v1_size=torch.linalg.norm(v1, dim=-1, keepdim=True)
+    v1_size=torch.where(v1_size==0.0, 1e-12, v1_size)
 	
-	v1=v1/v1_size
-	v2=v2/torch.linalg.norm(v2, dim=-1, keepdim=True)
+    v1=v1/v1_size
+    v2=v2/torch.linalg.norm(v2, dim=-1, keepdim=True)
 
-	dotted=torch.sum(v1*v2, dim=-1)
-	angle=torch.arccos(torch.clip(dotted, -1.0, 1.0))
+    dotted=torch.sum(v1*v2, dim=-1)
+    angle=torch.arccos(torch.clip(dotted, -1.0, 1.0))
 
-	if return_type=='degree':
-		return torch.rad2deg(angle)%360
-	else:
-		return angle
+    if return_type=='degree':
+        return torch.rad2deg(angle) % 360
+    else:
+        return angle
 
 
 def fibonacci_sphere(num_points):
         
-        indices = torch.arange(num_points, dtype=torch.float32)
-        z = 1 - (indices / (num_points - 1)) * 2
+    indices = torch.arange(num_points, dtype=torch.float32)
+    z = 1 - (indices / (num_points - 1)) * 2
        
-        radius = torch.sqrt(1 - z * z)
-        golden_angle = math.pi * (3 - math.sqrt(5))  # ≈ 2.39996
-        theta = golden_angle * indices
+    radius = torch.sqrt(1 - z * z)
+    golden_angle = math.pi * (3 - math.sqrt(5))  # ≈ 2.39996
+    theta = golden_angle * indices
 
-        x = torch.cos(theta) * radius
-        y = torch.sin(theta) * radius
+    x = torch.cos(theta) * radius
+    y = torch.sin(theta) * radius
 
-        points = torch.stack((x, y, z), dim=1)
+    points = torch.stack((x, y, z), dim=1)
 
-        return points
+    return points
 
 def target_spatial_spectrum(target_spherical_position, DOA_candidates, vad_framed, gammas, framing_func):
+    """
+    격자점이 화자의 실제 방향과 정확히 일치하면 값이 1,
+    멀어질수록 gamma(빔폭)에 따라 정해진 속도로 부드럽게 0에 가까워지는 연속값 가우시안형(vMF) 히트맵을 만들고,
+    5번 단계에서 VAD와 곱해지고 화자 간 max를 취해 최종 ground-truth spatial spectrum 생성
 
-    x,y,z=sph2cart(target_spherical_position[...,0, :], target_spherical_position[...,1, :], target_spherical_position[...,2, :], is_degree=True)
-
+    len(gammas)는 반환값의 DS(depth-stage) 축 크기가 되며, 이는 loss.py에서 element-wise로 비교되는
+    model.main.AGG_RL.forward()의 x_out(GridNet num_blocks에서 나온 DS 축)과 반드시 일치해야 함
+    """
+    # 1. 구면좌표 → 직교좌표 변환 target_xyz_position: (B, Q, 3, T)
+    x,y,z=sph2cart(target_spherical_position[..., 0, :], target_spherical_position[...,1, :], target_spherical_position[...,2, :], is_degree=True)
     target_xyz_position=torch.stack((x,y,z), dim=-1).transpose(2,3) 
     target_xyz_poisition_framed=framing_func(target_xyz_position) 
     target_xyz_poisition_framed=target_xyz_poisition_framed.unsqueeze(2) 
-    target_xyz_poisition_framed=target_xyz_poisition_framed.transpose(-1, -2) 
+    target_xyz_poisition_framed=target_xyz_poisition_framed.transpose(-1, -2)  # (B, Q, 1, T, 3)
 
-    DOA_candidates=DOA_candidates.view(1, 1, DOA_candidates.shape[0], 3, 1).to(target_xyz_poisition_framed.device) 
-
+    # 2. DOA candidate 격자 준비
+    # reshape: (D=2048, 3) -> (1, 1, D, 3, 1)
+    DOA_candidates=DOA_candidates.view(1, 1, DOA_candidates.shape[0], 3, 1).to(target_xyz_poisition_framed.device)
+    # (D, 3)을 브로드캐스팅 가능하게 (1, 1, D, 1, 3)으로 reshape
     DOA_candidates=DOA_candidates.transpose(-1, -2)
 
+    # 3. 각도 거리 계산
+    # 각 화자의 실제 위치와 D개 격자점 사이 각도 차이 계산 → candidate_distance: (B, Q, D, T)
     candidate_distance=get_cos_distance(target_xyz_poisition_framed, DOA_candidates, return_type='radian')
 
-
+    # 4. von Mises-Fisher 커널 적용
     gammas = torch.tensor(gammas, dtype=torch.float32, device=candidate_distance.device).view(1, -1, 1, 1)  
-    gammas = torch.deg2rad(gammas)  
+    gammas = torch.deg2rad(gammas)  # (1, DS, 1, 1)
 
-    kappa = math.log(0.5**0.5) / (torch.cos(gammas) - 1).unsqueeze(2)  
-    candidate_distance=candidate_distance.unsqueeze(1)
-    candidate_distance = torch.exp(kappa * (torch.cos(candidate_distance) - 1))  
+    # f(theta) = exp(kappa(cos(theta) - 1))
+    # 각도가 gamma일 때 값이 half-power가 되도록 하는 kappa를 역산
+    kappa = math.log(0.5**0.5) / (torch.cos(gammas) - 1).unsqueeze(2)  # (1, DS, 1, 1, 1)
+    candidate_distance = candidate_distance.unsqueeze(1)  # (B, 1, Q, D, T)
+    candidate_distance = torch.exp(kappa * (torch.cos(candidate_distance) - 1))  # (B, DS, Q, D, T)
 
-    vad_framed=vad_framed.view(vad_framed.shape[0], 1, vad_framed.shape[1],  1, -1)  
+    # 5. VAD(발화 여부) 마스킹 + 화자 간 max 병합
+    # 여러 화자(Q명)가 있을 때, 격자점별로 가장 강한 화자의 활성값을 취함 (multi-speaker spectrum 합성)
+    vad_framed=vad_framed.view(vad_framed.shape[0], 1, vad_framed.shape[1],  1, -1)
     target = vad_framed * candidate_distance  
     target = torch.max(target, dim=2).values  
-    return target  
 
-def channelwise_softmax_aggregation(x, std=True):
+    return target  # (B, DS, D, T)
 
-    out_softmax=x.softmax(dim=1)
-    out=x*out_softmax
-  
-    out_sum=out.sum(dim=1, keepdim=False)
+def channelwise_softmax_aggregation(x: torch.Tensor, std=True):
+    """
+    (B, P, F, T)
+    B: batch
+    P: 기준 마이크 대비 비기준 마이크 수 (= C - 1, channel-pair 축)
+    F: feature 차원 (128)
+    T: 시간 frame
+    """
+    out_softmax = x.softmax(dim=1) # (B, P, F, T) → (B, F, T)
+    out = out_softmax * x  # (B, P, F, T)
+
+    out_sum = out.sum(dim=1, keepdim=False)  # (B, F, T)
 
     if std:
-        out_std=out.std(dim=1, keepdim=False)
-        out=torch.cat([out_sum, out_std], dim=1)
+        out_std = out.std(dim=1, keepdim=False)  # (B, F, T)
+        out = torch.cat([out_sum, out_std], dim=1)  # (B, 2F, T)
     else:
         out= out_sum
-  
+
     return out
 
 def sph2cart(azimuth, elevation, distance, is_degree=True):
@@ -119,7 +143,7 @@ class LayerNorm(nn.Module):
     def apply_gain_and_bias(self, normed_x):
  
         return (self.gamma * normed_x.transpose(1, -1) + self.beta).transpose(1, -1)
-    
+
 
 class ResidualBlock(nn.Module):
 

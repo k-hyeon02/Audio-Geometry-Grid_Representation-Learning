@@ -140,8 +140,27 @@ def compute_gt_doa(array_pos: np.ndarray, array_rot: np.ndarray,
 # ---------------------------------------------------------------------------
 # clean 기준 신호에서 VAD 추출
 # ---------------------------------------------------------------------------
+def _read_locata_vad(path: str) -> np.ndarray | None:
+    """LOCATA 공식 VAD_source_*.txt (헤더 'VAD' + 샘플당 0/1)을 읽는다.
+
+    원본 array 오디오와 샘플 단위로 1:1 대응한다(둘 다 48 kHz). 없으면 None.
+    """
+    if not os.path.exists(path):
+        return None
+    vals = []
+    with open(path) as fh:
+        for line in fh:
+            s = line.strip()
+            if not s or s == "VAD":
+                continue
+            vals.append(float(s))
+    if not vals:
+        return None
+    return np.asarray(vals, dtype=np.float32)
+
+
 def _vad_from_source(audio_source: np.ndarray, fs: int) -> np.ndarray:
-    """clean close-talk 음원에서 샘플 단위 VAD를 계산한다(에너지 기반)."""
+    """clean close-talk 음원에서 샘플 단위 VAD를 계산한다(에너지 기반, fallback)."""
     frame = int(fs * 0.03)
     out = np.zeros(audio_source.shape[0], dtype=np.float32)
     peak = np.max(np.abs(audio_source)) + 1e-8
@@ -196,16 +215,25 @@ def load_recording(rec_dir: str, array_name: str, max_speakers: int = 2):
         spherical[i, 1, :] = el
         spherical[i, 2, :] = dist
 
-        # clean close-talk 기준 신호가 있으면 그것으로 VAD 계산
+        # VAD: LOCATA 공식 VAD 파일을 우선 사용(원본 fs 기준 -> FS_TARGET로 재표본화).
         src_tag = os.path.basename(sp_path).replace("position_source_", "").replace(".txt", "")
-        asrc = os.path.join(rec_dir, f"audio_source_{src_tag}.wav")
-        if os.path.exists(asrc):
-            a, asr = _read_wav(asrc)
-            a = _resample(a[:, 0:1], asr, FS_TARGET)[:, 0]
-            v = _vad_from_source(a, FS_TARGET)
-            vad[i, :min(T, len(v))] = v[:min(T, len(v))]
+        vad_txt = os.path.join(rec_dir, f"VAD_source_{src_tag}.txt")
+        v_official = _read_locata_vad(vad_txt)
+        if v_official is not None:
+            # 원본 array 오디오와 1:1(48 kHz) -> 16 kHz 오디오 길이 T에 맞춰 최근접 인덱싱
+            src_idx = (np.arange(T, dtype=np.float64) * (len(v_official) / T)).astype(np.int64)
+            src_idx = np.clip(src_idx, 0, len(v_official) - 1)
+            vad[i, :] = (v_official[src_idx] > 0.5).astype(np.float32)
         else:
-            vad[i, :] = 1.0                              # 기준 신호 없으면 항상 활성으로 가정
+            # fallback: clean close-talk 신호 에너지 기반 VAD
+            asrc = os.path.join(rec_dir, f"audio_source_{src_tag}.wav")
+            if os.path.exists(asrc):
+                a, asr = _read_wav(asrc)
+                a = _resample(a[:, 0:1], asr, FS_TARGET)[:, 0]
+                v = _vad_from_source(a, FS_TARGET)
+                vad[i, :min(T, len(v))] = v[:min(T, len(v))]
+            else:
+                vad[i, :] = 1.0                          # 기준 신호 없으면 항상 활성으로 가정
 
     return {
         "vad": vad[:n_spk].astype(bool),

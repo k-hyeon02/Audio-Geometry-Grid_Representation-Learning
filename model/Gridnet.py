@@ -79,23 +79,25 @@ class Gridnet_list(torch.nn.Module):
 
     def forward(self, audio_representaion, DOA_candidates=None):
 
-        if DOA_candidates is None: 
-            DOA_candidates = fibonacci_sphere(self.fibonacci_size)  # (fibonacci_size, 3)
-        
+        # audio_representaion: (B, DS, R, T)
+        if DOA_candidates is None:
+            DOA_candidates = fibonacci_sphere(self.fibonacci_size)  # (D, 3), D = fibonacci_size (DOA 후보 수)
+
         DOA_candidates = DOA_candidates.to(audio_representaion.device)
 
-        grid_input,  DOA_spherical_candidates= self.sinusoidal_feature(DOA_candidates)  # (fibonacci_size, representation_size)
+        grid_input,  DOA_spherical_candidates= self.sinusoidal_feature(DOA_candidates)  # grid_input: (D, R)
 
         grid_representations = []
 
         for net in self.gridnet_list:
-            grid_representation = net(grid_input)
+            grid_representation = net(grid_input)  # (D, R)
             grid_representations.append(grid_representation)
 
-        grid_representations = torch.stack(grid_representations, dim=0).unsqueeze(0) 
+        grid_representations = torch.stack(grid_representations, dim=0).unsqueeze(0)  # (1, DS, D, R)
 
         G_root = self.representation_size ** 0.5
 
+        # (1, DS, D, R) @ (B, DS, R, T) → (B, DS, D, T)
         spatial_spectrum_output = torch.matmul(grid_representations, audio_representaion/G_root)
 
         return spatial_spectrum_output.sigmoid(), DOA_candidates, DOA_spherical_candidates

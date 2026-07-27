@@ -8,11 +8,13 @@ import torch
 from torch.optim import Adam
 
 from data.dataset import SyntheticDOADataset, build_dataloader
+from data.simulate import SimulationConfig
 from .gradual import (
     DEFAULT_STAGE_SPECS,
     layer_gammas_for_epoch,
     stage_for_epoch,
     total_epochs,
+    validation_suite_for_stage,
 )
 from .loss import spatial_spectrum_loss
 
@@ -90,10 +92,24 @@ def _run_loader(
     start_time = time.monotonic()
     total_batches = len(loader) if hasattr(loader, "__len__") else None
 
+    # stage3는 배치마다 채널 수(4~12)가 바뀐다. 서로 다른 크기의 텐서가 PyTorch
+    # 캐시 할당자에 예약된 채 안 풀려 reserved 메모리가 파편화로 누적되고, 결국
+    # batch16 stage3에서 OOM을 유발한다(실측: reserved가 7GB→24GB로 증가).
+    # 채널 수가 바뀔 때만 empty_cache로 캐시를 비워 파편화를 막는다.
+    # (매 배치 호출은 재할당 비용이 커서, 채널 변경 시에만 호출해 속도 손실을 줄인다.)
+    prev_num_channels: int | None = None
+
     for batch in loader:
         # 배치 텐서를 모두 학습 디바이스로 이동
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         input_audio = batch["input_audio"]
+
+        # 채널 수가 직전 배치와 달라졌으면 캐시를 비워 파편화 누적을 막는다.
+        current_num_channels = int(input_audio.shape[1])
+        if prev_num_channels is not None and current_num_channels != prev_num_channels:
+            if device != "cpu":
+                torch.cuda.empty_cache()
+        prev_num_channels = current_num_channels
         vad = batch["vad"]
         mic_coordinate = batch["mic_coordinate"]
         # AGG-RL은 시간축 trajectory(spherical_position)로 oracle target을 만든다.
@@ -148,8 +164,12 @@ def _run_loader(
 def train(
     model: torch.nn.Module,
     train_dataset: SyntheticDOADataset,
-    validation_datasets: Mapping[str, SyntheticDOADataset],
+    librispeech_val: str,
+    ms_snsd_val: str,
     device: str,
+    simulation_config: SimulationConfig | None = None,
+    fixed_suite_samples: int = 2_000,
+    dynamic_samples_per_channel: int = 300,
     batch_size: int = 16,
     num_workers: int = 4,
     prefetch_factor: int = 1,
@@ -158,8 +178,33 @@ def train(
     resume_path: str | None = None,
     stage_specs=DEFAULT_STAGE_SPECS,
     max_epochs: int | None = None,
+    seed: int = 42,
 ) -> None:
     os.makedirs(save_dir, exist_ok=True)
+    simulation_config = simulation_config or SimulationConfig()
+
+    def build_validation_dataset(stage: int) -> tuple[str, SyntheticDOADataset]:
+        # AGG-RL A.9: 현재 stage에 맞는 단일 검증 스위트를 test-clean + MS-SNSD
+        # test로 합성 생성한다. stage 1-2는 2,000 샘플, stage 3은 채널당 300 샘플.
+        suite = validation_suite_for_stage(
+            stage,
+            fixed_suite_samples=fixed_suite_samples,
+            dynamic_samples_per_channel=dynamic_samples_per_channel,
+        )
+        dataset = SyntheticDOADataset(
+            librispeech_root=librispeech_val,
+            ms_snsd_root=ms_snsd_val,
+            num_samples=suite.num_samples,
+            profile=suite.profile,
+            batch_size=batch_size,
+            seed=seed + 1_000 * stage,
+            simulation_config=simulation_config,
+            channel_schedule=suite.channel_schedule,
+            rotate_arrays=suite.rotate_arrays,
+        )
+        # 검증셋은 에폭에 무관하게 고정된 분포를 쓰도록 epoch 0으로 고정한다.
+        dataset.set_epoch(0)
+        return suite.name, dataset
 
     # 초기 stage(stage 1)의 LR/weight_decay로 Adam 옵티마이저 생성 (A.9: Adam).
     initial_stage = stage_specs[0]
@@ -187,14 +232,14 @@ def train(
         start_epoch = int(checkpoint["epoch"]) + 1
         best_val_loss = float(checkpoint.get("best_val_loss", best_val_loss))
 
-    # 검증 데이터셋은 에폭에 무관하게 고정된 분포를 쓰도록 epoch 0으로 고정
-    for dataset in validation_datasets.values():
-        dataset.set_epoch(0)
-
     # 전체 학습 종료 에폭(기본 300). max_epochs가 주어지면 그만큼만 추가로 돈다.
     end_epoch = total_epochs(stage_specs)
     if max_epochs is not None:
         end_epoch = min(end_epoch, start_epoch + max_epochs - 1)
+
+    # 현재 stage의 검증셋(이름, 데이터셋). stage 전환 시 새로 생성한다.
+    val_name: str | None = None
+    val_dataset: SyntheticDOADataset | None = None
 
     current_stage = None
     for epoch in range(start_epoch, end_epoch + 1):
@@ -207,6 +252,8 @@ def train(
                 weight_decay=stage.weight_decay,
             )
             train_dataset.set_profile(stage.profile)
+            # A.9: stage가 바뀌면 검증셋도 해당 stage 스펙으로 교체한다.
+            val_name, val_dataset = build_validation_dataset(stage.stage)
             current_stage = stage.stage
 
         # 에폭마다 데이터 시드를 갱신해 on-the-fly로 새 샘플을 생성
@@ -238,49 +285,36 @@ def train(
             log_interval=log_interval,
         )
 
-        # ---- 검증 (suite별) ----
+        # ---- 검증 (현재 stage의 단일 스위트, A.9) ----
         model.eval()
-        validation_results: dict[str, float] = {}
-        weighted_val_loss = 0.0
-        weighted_batches = 0
         with torch.no_grad():
-            for name, dataset in validation_datasets.items():
-                val_loader = build_dataloader(
-                    dataset,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    prefetch_factor=prefetch_factor,
-                    shuffle=False,
-                )
-                val_loss, _, num_batches = _run_loader(
-                    model=model,
-                    loader=val_loader,
-                    device=device,
-                    gammas=gammas,
-                    optimizer=None,
-                    log_label=f"epoch={epoch:03d} val:{name}",
-                    log_interval=log_interval,
-                )
-                validation_results[name] = val_loss
-                # suite별 배치 수로 가중 평균 (큰 suite가 더 큰 영향)
-                weighted_val_loss += val_loss * num_batches
-                weighted_batches += num_batches
+            val_loader = build_dataloader(
+                val_dataset,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor,
+                shuffle=False,
+            )
+            mean_val_loss, _, _ = _run_loader(
+                model=model,
+                loader=val_loader,
+                device=device,
+                gammas=gammas,
+                optimizer=None,
+                log_label=f"epoch={epoch:03d} val:{val_name}",
+                log_interval=log_interval,
+            )
 
-        # 전체 검증 손실(가중 평균)로 LR 스케줄러 갱신
-        mean_val_loss = weighted_val_loss / max(weighted_batches, 1)
+        # 검증 손실로 LR 스케줄러 갱신
         scheduler.step(mean_val_loss)
 
         # 에폭 요약 로그
         timestamp = time.strftime("%H:%M:%S")
-        suite_summary = ", ".join(
-            f"{name}={loss:.4f}" for name, loss in validation_results.items()
-        )
         print(
             f"[{timestamp}] epoch={epoch:03d} stage={stage.stage} "
             f"gamma={[round(g, 2) for g in gammas]} "
-            f"train={train_loss:.4f} val={mean_val_loss:.4f} "
-            f"layers={[round(float(x), 4) for x in train_layer_loss.tolist()]} "
-            f"val_suites({suite_summary})"
+            f"train={train_loss:.4f} val:{val_name}={mean_val_loss:.4f} "
+            f"layers={[round(float(x), 4) for x in train_layer_loss.tolist()]}"
         )
 
         # 체크포인트 저장: 매 에폭 latest, 최저 검증손실 best, 10에폭마다 스냅샷

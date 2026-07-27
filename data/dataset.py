@@ -13,8 +13,25 @@ import webrtcvad
 from scipy.signal import resample_poly
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from .mic_arrays import get_fixed_array, random_rotate, sample_dynamic_array
-from .simulate import N_SPK, SimulationConfig, simulate_one_sample
+from .mic_arrays import (
+    get_fixed_array,
+    random_rotate,
+    sample_dynamic_array_vectorized,
+)
+from .simulate import (
+    N_SPK,
+    SimulationConfig,
+    simulate_one_sample,
+)
+
+
+# ── shape 기호 대응 (모델측 단일문자 ↔ 이 파일의 서술형 이름) ──────────────
+#   num_channels  = C  (마이크 채널 수)
+#   N_SPK/n_spk   = Q  (최대 화자 수)
+#   샘플수/length = N  (오디오 샘플 수)
+# __getitem__은 batch 축(B) 없이 sample당 텐서를 반환하고, 이후 DataLoader가
+# B 축을 붙여 model.forward의 입력 (B, C, N) / (B, Q, N) / (B, C, 3) 등이 된다.
+# ─────────────────────────────────────────────────────────────────────
 
 
 # MSGL stage는 AGG-RL Table 6을 따른다: stage 1 = 고정 4cm 정사면체(4ch),
@@ -28,6 +45,8 @@ PROFILE_SPECS = {
     "nao12": {"array_type": "nao12", "channel_range": (12, 12)},
     "dynamic4": {"array_type": "dynamic", "channel_range": (4, 4)},
     "dynamic4to12": {"array_type": "dynamic", "channel_range": (4, 12)},
+    # 논문 Table 2의 Dynamic-U(unseen): 13-16ch. 학습 범위(4-12) 밖.
+    "dynamic13to16": {"array_type": "dynamic", "channel_range": (13, 16)},
 }
 
 WEBRTC_VAD_FRAME_MS = 30
@@ -226,7 +245,7 @@ class SyntheticDOADataset(Dataset):
         array_type = PROFILE_SPECS[self.profile]["array_type"]
         # 동적 배열 프로필이면 채널 수에 맞춰 매번 새로운 배열 샘플링
         if array_type == "dynamic":
-            coords = sample_dynamic_array(num_channels, rng=rng)
+            coords = sample_dynamic_array_vectorized(num_channels, rng=rng)
         # 고정 배열 프로필이면 미리 정의된 배열 좌표
         else:
             coords = get_fixed_array(array_type)

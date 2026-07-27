@@ -34,9 +34,9 @@ class MicrophonePositionalEncoding(torch.nn.Module):
        
         azimuth, elevation, distance = cart2sph(mic_coord_cart[..., 0], mic_coord_cart[..., 1], mic_coord_cart[..., 2], is_degree=False)
 
-        azimuth = azimuth.unsqueeze(-1)  # B, C, 1
-        elevation = elevation.unsqueeze(-1)
-        distance = distance.unsqueeze(-1)
+        azimuth = azimuth.unsqueeze(-1)  # (B, P, 1)
+        elevation = elevation.unsqueeze(-1)  # (B, P, 1)
+        distance = distance.unsqueeze(-1)  # (B, P, 1)
 
         pe_list = []
 
@@ -51,8 +51,8 @@ class MicrophonePositionalEncoding(torch.nn.Module):
             pe_list.append(torch.cos(elevation + 2 * torch.pi * self.beta * self.v))
             pe_list.append(torch.sin(elevation + 2 * torch.pi * self.beta * self.v))
         
-        pe = distance * self.alpha * torch.cat(pe_list, dim=-1)
+        pe = distance * self.alpha * torch.cat(pe_list, dim=-1)  # (B, P, F), F=128
 
-        mic_coord_sph_dist_sin_cos = torch.cat([torch.sin(azimuth), torch.cos(azimuth), torch.sin(elevation), torch.cos(elevation), distance], dim=-1)
+        mic_coord_sph_dist_sin_cos = torch.cat([torch.sin(azimuth), torch.cos(azimuth), torch.sin(elevation), torch.cos(elevation), distance], dim=-1)  # (B, P, 5)
 
-        return pe, mic_coord_cart, mic_coord_sph_dist_sin_cos
+        return pe, mic_coord_cart, mic_coord_sph_dist_sin_cos  # pe: (B, P, F), mic_coord_cart: (B, P, 3), *_dist_sin_cos: (B, P, 5)

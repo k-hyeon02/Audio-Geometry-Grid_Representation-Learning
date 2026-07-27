@@ -7,7 +7,19 @@ from typing import Sequence
 import numpy as np  # 수치 계산 라이브러리
 from scipy.signal import fftconvolve  # FFT 기반 고속 convolution
 
-import gpuRIR  # type: ignore  # GPU RIR(Room Impulse Response) 시뮬레이션 라이브러리
+# ── shape 기호 대응 (모델측 단일문자 ↔ 이 파일의 서술형 이름) ──────────────
+#   num_channels  = C  (마이크 채널 수)
+#   max_speakers  = Q  (최대 화자 수)
+#   num_sources   = 활성 화자 + 노이즈 음원 수 (RIR bank 축)
+#   length        = N  (오디오 샘플 수)
+# batch 축(B)은 이후 DataLoader collate 단계에서 붙는다.
+# ─────────────────────────────────────────────────────────────────────
+
+# gpuRIR는 import 시점에 CUDA를 초기화한다(= CUDA_VISIBLE_DEVICES가 그 순간 고정).
+# 그래서 여기서 top-level import하지 않고 _render_rir_bank 안에서 lazy import한다.
+# 이렇게 하면 DataLoader worker가 worker_init_fn에서 CUDA_VISIBLE_DEVICES를 먼저
+# 지정한 뒤 gpuRIR가 처음 로드되므로, gpuRIR를 원하는 GPU에 붙일 수 있다
+# (GPU 2개 분리: 학습=GPU0, gpuRIR=GPU1). 1 GPU 학습에는 영향이 없다.
 
 # 음향 시뮬레이션의 기본 파라미터
 FS = 16_000  # 샘플링 레이트: 16kHz
@@ -254,6 +266,10 @@ def _render_rir_bank(
     rt60: float,
     config: SimulationConfig,
 ) -> np.ndarray:
+    # gpuRIR lazy import: 이 시점 이전에 worker_init_fn이 CUDA_VISIBLE_DEVICES를
+    # 지정했다면 gpuRIR가 그 GPU에 붙는다(2 GPU 분리). 1 GPU면 그냥 기본 GPU.
+    import gpuRIR  # type: ignore
+
     # Sabine 이론으로 벽 반사 계수(beta) 계산: RT60 기반
     beta = gpuRIR.beta_SabineEstimation(room_size, rt60)
 
@@ -432,19 +448,23 @@ def simulate_one_sample(
     for speaker_idx in range(1, num_active_speakers):
         # 화자 간 간섭 (SIR) 설정: 첫 화자 기준 현재 화자를 얼마나 키우거나 줄일지
         sir_db = float(rng.uniform(*config.utterance_sir_db))  # SIR: [-5, 5] dB
-        # 스케일 계산: 첫 화자(기준)과의 dB 차이가 sir_db가 되도록
-        scale = _scale_to_db(mixed_speech[0], speech_signals[speaker_idx][0], sir_db)
+        # 스케일 계산: 첫 화자(기준)가 간섭 화자보다 sir_db만큼 커지도록 (부호 반전 필수)
+        scale = _scale_to_db(mixed_speech[0], speech_signals[speaker_idx][0], -sir_db)
         # 스케일된 화자 신호 혼합
         mixed_speech += speech_signals[speaker_idx] * scale
 
     # 두 가지 노이즈 혼합: coherent noise + white noise
     noise_sir_db = float(rng.uniform(*config.noise_sir_db))  # coherent noise 대 white noise 비율
-    white_scale = _scale_to_db(coherent_noise_mc[0], white_noise[0], noise_sir_db)
+    # coherent noise가 white noise보다 noise_sir_db만큼 커지도록 (부호 반전 필수)
+    white_scale = _scale_to_db(coherent_noise_mc[0], white_noise[0], -noise_sir_db)
     mixed_noise = coherent_noise_mc + white_noise * white_scale  # (num_channels, length)
 
     # 음성 대 노이즈의 전체 SNR 설정
     snr_db = float(rng.uniform(*config.snr_db))  # SNR: [-5, 30] dB
-    noise_scale = _scale_to_db(mixed_speech[0], mixed_noise[0], snr_db)
+    # _scale_to_db(reference, signal, target_db)는 signal이 reference보다 target_db만큼
+    # "커지도록" 스케일링한다. SNR은 speech가 noise보다 snr_db만큼 커야 하므로
+    # noise 쪽을 -snr_db로 스케일링해야 한다 (부호 반전 필수).
+    noise_scale = _scale_to_db(mixed_speech[0], mixed_noise[0], -snr_db)
     # 최종 혼합: speech + noise, peak normalization으로 클리핑 방지
     mixture = _normalize_peak(mixed_speech + mixed_noise * noise_scale)  # (num_channels, length)
 

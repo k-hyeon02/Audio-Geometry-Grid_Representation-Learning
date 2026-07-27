@@ -19,9 +19,7 @@ class ValidationSuiteSpec:
     profile: str
     num_samples: int
     channel_schedule: tuple[int, ...] | None = None
-    # 고정 상용 배열(nao12 등)은 native orientation으로 평가한다.
-    # 평면형 배열을 무작위 회전시키면 azimuth 기준계가 틀어지므로,
-    # 무작위 3D 회전은 dynamic 배열 다양화에만 쓴다.
+    # dynamic 검증 배열은 학습과 동일하게 무작위 3D 회전으로 다양화한다.
     rotate_arrays: bool = True
 
 
@@ -77,25 +75,37 @@ def layer_gammas_for_epoch(
     ]
 
 
-def default_validation_suites(
+def validation_suite_for_stage(
+    stage: int,
     fixed_suite_samples: int = 2_000,
     dynamic_samples_per_channel: int = 300,
-) -> tuple[ValidationSuiteSpec, ...]:
-    # AGG-RL A.9: stage 1-2 검증은 2,000 샘플, stage 3는 채널당 300 샘플.
-    # 검증 배열은 nao12(seen 실데이터 NAO robot 대응) + dynamic(4ch / 4-12ch).
-    # GI-DOAEnet이 쓰던 respeaker 스위트는 AGG-RL에서 사용하지 않으므로 제외한다.
-    channel_schedule = tuple(
-        channel
-        for channel in range(4, 13)
-        for _ in range(dynamic_samples_per_channel)
-    )
-    return (
-        ValidationSuiteSpec("nao12", "nao12", fixed_suite_samples, rotate_arrays=False),
-        ValidationSuiteSpec("dynamic4", "dynamic4", fixed_suite_samples),
-        ValidationSuiteSpec(
-            "dynamic4to12",
-            "dynamic4to12",
+) -> ValidationSuiteSpec:
+    """AGG-RL A.9의 stage별 검증 스위트를 하나 반환한다.
+
+    논문 A.9: "validation was conducted after every epoch
+    (2,000 samples in stages 1–2, and 300 samples per channel in stage 3)".
+    검증셋은 학습과 동일하게 test-clean + MS-SNSD test로 합성 생성하며,
+    배열 프로필은 해당 stage의 학습 프로필(Table 6)과 일치시킨다.
+    stage 1 = Tetrahedron(4ch), stage 2 = dynamic(4ch),
+    stage 3 = dynamic(4-12ch, 채널당 300 샘플).
+    """
+    if stage == 1:
+        # stage 1 학습 배열(Tetrahedron 4ch)과 동일한 프로필로 2,000 샘플 검증.
+        return ValidationSuiteSpec("stage1", "stage1", fixed_suite_samples)
+    if stage == 2:
+        # stage 2 학습 배열(dynamic 4ch)과 동일한 프로필로 2,000 샘플 검증.
+        return ValidationSuiteSpec("stage2", "stage2", fixed_suite_samples)
+    if stage == 3:
+        # stage 3: dynamic 4-12ch, 채널당 dynamic_samples_per_channel 샘플.
+        channel_schedule = tuple(
+            channel
+            for channel in range(4, 13)
+            for _ in range(dynamic_samples_per_channel)
+        )
+        return ValidationSuiteSpec(
+            "stage3",
+            "stage3",
             len(channel_schedule),
             channel_schedule=channel_schedule,
-        ),
-    )
+        )
+    raise ValueError(f"No validation suite defined for stage {stage}.")

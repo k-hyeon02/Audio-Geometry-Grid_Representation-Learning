@@ -7,7 +7,7 @@ import torch
 from data.dataset import SyntheticDOADataset
 from data.simulate import SimulationConfig
 from model.main import AGG_RL
-from trainer.gradual import DEFAULT_STAGE_SPECS, default_validation_suites
+from trainer.gradual import DEFAULT_STAGE_SPECS
 from trainer.train import train
 
 
@@ -55,27 +55,9 @@ def main() -> None:
         simulation_config=simulation_config,
     )
 
-    # 검증 suite들(nao12 / dynamic4 / dynamic4to12)을 각각 데이터셋으로 구성
-    validation_datasets = {}
-    for suite_index, suite in enumerate(
-        default_validation_suites(
-            fixed_suite_samples=args.fixed_suite_samples,
-            dynamic_samples_per_channel=args.dynamic_samples_per_channel,
-        ),
-        start=1,
-    ):
-        validation_datasets[suite.name] = SyntheticDOADataset(
-            librispeech_root=args.librispeech_val,
-            ms_snsd_root=args.ms_snsd_val,
-            num_samples=suite.num_samples,
-            profile=suite.profile,
-            batch_size=args.batch_size,
-            seed=args.seed + 1_000 * suite_index,
-            simulation_config=simulation_config,
-            channel_schedule=suite.channel_schedule,
-            rotate_arrays=suite.rotate_arrays,
-        )
-
+    # 검증셋은 stage마다 달라지므로(A.9), train()이 stage 전환 시점에
+    # validation_suite_for_stage로 직접 생성한다. 여기서는 생성에 필요한
+    # 재료(검증용 경로/샘플 수)만 넘긴다.
     num_params = sum(parameter.numel() for parameter in model.parameters())
     print(f"device={device}")
     print(f"model=AGG_RL({args.mpe_type}) params={num_params:,}")
@@ -83,16 +65,15 @@ def main() -> None:
         f"train_speech={len(train_dataset.speech_files)} "
         f"train_noise={len(train_dataset.noise_files)}"
     )
-    for name, dataset in validation_datasets.items():
-        print(
-            f"val_suite={name} speech={len(dataset.speech_files)} "
-            f"noise={len(dataset.noise_files)} samples={len(dataset)}"
-        )
 
     train(
         model=model,
         train_dataset=train_dataset,
-        validation_datasets=validation_datasets,
+        librispeech_val=args.librispeech_val,
+        ms_snsd_val=args.ms_snsd_val,
+        simulation_config=simulation_config,
+        fixed_suite_samples=args.fixed_suite_samples,
+        dynamic_samples_per_channel=args.dynamic_samples_per_channel,
         device=device,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -102,6 +83,7 @@ def main() -> None:
         resume_path=args.resume,
         max_epochs=args.max_epochs,
         stage_specs=DEFAULT_STAGE_SPECS,
+        seed=args.seed,
     )
 
 

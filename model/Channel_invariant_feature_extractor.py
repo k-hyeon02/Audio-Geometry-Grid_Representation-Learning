@@ -18,22 +18,23 @@ class Channel_invariant_feature_extractor(torch.nn.Module):
                                                         norm='BN'))   
              
     def forward(self, x, MPE, mic_coord_cart, mic_coord_dist_sin_cos):
-     
-        B, C, F, T=x.shape
-        MPE = MPE.view(B*C, -1, 1).repeat_interleave(T, dim=-1)  
+        # x: (B, P, 2K, T) = (B, C-1, 514, T)
+        # FK: 입력 2K(=514) freq-concat 차원 (ConvBlock을 거쳐 feature F=128이 됨)
+        B, P, FK, T=x.shape
+        MPE = MPE.view(B*P, -1, 1).repeat_interleave(T, dim=-1)  # (B*P, F, T), F=128
 
-        x=x.view(B*C, F, T)
+        x=x.view(B*P, FK, T)  # (B*P, 2K, T)
         x=self.init_BN(x)
-      
-        mic_coord = torch.cat([mic_coord_cart, mic_coord_dist_sin_cos], dim=-1)  
-        mic_coord= mic_coord.view(B*C, -1, 1).repeat_interleave(T, dim=2)  
-        x=torch.cat([x, mic_coord], dim=1   )
-        x=self.init_ConvBlock(x)
+
+        mic_coord = torch.cat([mic_coord_cart, mic_coord_dist_sin_cos], dim=-1)  # (B, P, 8)
+        mic_coord= mic_coord.view(B*P, -1, 1).repeat_interleave(T, dim=2)  # (B*P, 8, T)
+        x=torch.cat([x, mic_coord], dim=1   )  # (B*P, 2K+8, T) = (B*P, 522, T)
+        x=self.init_ConvBlock(x)  # (B*P, F, T) = (B*P, 128, T)
 
         for i in range(len(self.ResidualConvBlocks)):
             x= x+MPE
-            x=self.ResidualConvBlocks[i](x)
-        
-        x=x.view(B, C, x.shape[1], T)
-        
-        return x 
+            x=self.ResidualConvBlocks[i](x)  # (B*P, F, T)
+
+        x=x.view(B, P, x.shape[1], T)  # (B, P, F, T) = (B, C-1, 128, T)
+
+        return x
